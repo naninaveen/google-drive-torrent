@@ -17,7 +17,7 @@ const sockets = {}; // {userId: socket}
 const parseTorrent = require('parse-torrent');
 const WebTorrent = require('webtorrent');
 
-const google = require('googleapis');
+const {google} = require('googleapis');
 const express = require('express');
 const helmet = require('helmet');
 const forceHttps = require('express-force-https');
@@ -25,8 +25,8 @@ const bodyParser = require('body-parser');
 const fileUpload = require('express-fileupload');
 const path = require('path');
 const util = require('util');
+const os = require('os');
 const locks = require('locks');
-const async = require('async');
 const _ = require('lodash');
 const zip = require('express-zip');
 const driveIO = require('google-drive-io');
@@ -35,7 +35,7 @@ const app = express();
 const server = require('http').createServer(app);
 const io = require('socket.io')(server);
 const ios = require('socket.io-express-session');
-const session = require('express-session')({ 
+const session = require('express-session')({
     secret: 'google-drive-torrent',
     resave: false,
     saveUninitialized: false,
@@ -87,7 +87,7 @@ app.get('/home', (req, res) => {
             options.error = req.query.error;
         }
         res.render('index.pug', options);
-   });    
+   });
 });
 
 
@@ -96,12 +96,12 @@ app.get('/dashboard', (req, res) => {
         const user = req.session.user;
         const driveUrl = req.session.driveUrl;
         res.render('dashboard.pug', {
-            name: user.displayName,
-            firstName: user.name.givenName,
-            pic: user.image.url,
+            name: user.names[0].displayName,
+            firstName: user.names[0].givenName,
+            pic: user.photos[0].url,
             driveUrl: driveUrl
         });
-    });    
+    });
 });
 
 /* PART II: Routes for authentication */
@@ -111,10 +111,14 @@ app.get('/login', (req, res) => {
         const url = newOAuth2Client().generateAuthUrl({
             access_type: 'offline',
             prompt: 'consent',
-            scope: ['https://www.googleapis.com/auth/plus.me', 'https://www.googleapis.com/auth/drive']
+            scope: [
+                'https://www.googleapis.com/auth/plus.me',
+                'https://www.googleapis.com/auth/drive',
+                'profile'
+            ]
         });
         res.redirect(url);
-    });    
+    });
 });
 
 // Accept authorisation code from Google
@@ -140,16 +144,19 @@ app.get('/login-callback', (req, res) => {
             oAuth2Client.setCredentials(tokens);
             console.log(`Obtained tokens: ${JSON.stringify(tokens)}`);
 
-            google.plus('v1').people.get({
+            google.people('v1').people.get({
                 auth: oAuth2Client,
-                userId: 'me'
-            }, (err, user) => {
+                resourceName: 'people/me',
+                personFields: 'names,photos,metadata'
+            }, (err, data) => {
                 if (err) {
                     console.error(`Failed to get user details: ${err}`);
                     return res.redirect(`/error`);
                 }
+                const user = data.data
+                user.id = user.metadata.sources[0].id
                 req.session.user = user;
-                console.log(`Obtained user: ${JSON.stringify(user)}`)
+                console.log(`Obtained user: ${JSON.stringify(user)}`);
 
                 driveIO.createFolderIfNotExists(DRIVE_TORRENT_DIR, DRIVE_RETURN_FIELDS, oAuth2Client, (err, folder) => {
                     if (err) {
@@ -160,13 +167,13 @@ app.get('/login-callback', (req, res) => {
                     return res.redirect('/dashboard');
                 });
             });
-        });    
-    });        
+        });
+    });
 });
 
 
 app.get('/logout', (req, res) => {
-    ifLoggedIn(req, res, () => {        
+    ifLoggedIn(req, res, () => {
         delete req.session.oAuth2Client;
         delete req.session.user;
         res.redirect(`/home`);
@@ -206,7 +213,7 @@ app.post('/add-torrent', (req, res) => {
         // Add callback handlers so that files get uploaded to google drive once ready
         torrent.once('ready', () => {
             console.log(`Torrent ${torrent.infoHash} is ready`);
-            attachCompleteHandler(torrent, oAuth2Client, socket);            
+            attachCompleteHandler(torrent, oAuth2Client, socket);
         });
 
         torrent.on('warning', (err) => {
@@ -214,7 +221,7 @@ app.post('/add-torrent', (req, res) => {
             socket.emit('torrent-warning', {
                 message: err.message
             });
-        });     
+        });
 
         torrent.on('error', (err) => {
             torrent.error = err.message;                       // Attach error onto torrent (hack!)
@@ -229,7 +236,7 @@ app.post('/add-torrent', (req, res) => {
                          (${torrent.progress * 100}%) @ ${torrent.downloadSpeed / 1024} kB/s. \
                          ETA: ${torrent.timeRemaining / 1000} sec`);*/
         });
-    });    
+    });
 });
 
 app.post('/update-torrent', (req, res) => {
@@ -250,7 +257,7 @@ app.post('/update-torrent', (req, res) => {
                 // file selected
                 file.select();
                 file.selected = true; // attach to file object (hack!) to retrieve later
-                console.log(`Selected file: ${file.name} for user ${user.id}`); 
+                console.log(`Selected file: ${file.name} for user ${user.id}`);
             }
 
             if (oldSelection && !newSelection) {
@@ -325,7 +332,7 @@ const loggedIn = (req) => {
 }
 
 const ifLoggedIn = (req, res, callback, otherwise) => {
-    if (!otherwise) { 
+    if (!otherwise) {
         otherwise = () => {
             res.redirect('/home')
         };
@@ -359,7 +366,7 @@ const newOAuth2Client = (tokens) => {
  * Adds a new torrent for the user (creating a new Webtorrent Client if neccessary),
  *  returns the added torrent and invokes callback(err, torrent).
  * @param  torrent anything Webtorrent identifies as a torrent (infoHash/magnetURI/.torrent etc)
- * @param  user Google Plus API user object 
+ * @param  user Google Plus API user object
  * @param  callback(err, torrent)
  * @return reference to Webtorrent torrent object
  */
@@ -367,7 +374,7 @@ const addTorrentForUser = (torrent, user, callback) => {
     const client = (user.id in torrentClients)? torrentClients[user.id]: new WebTorrent();
     torrentClients[user.id] = client;
 
-    try {          
+    try {
         const parsedTorrent = parseTorrent(torrent);
         const infoHash = parsedTorrent.infoHash;
         console.log(`Parsed infohash: ${infoHash}`);
@@ -377,8 +384,9 @@ const addTorrentForUser = (torrent, user, callback) => {
             callback(err);
         }
 
+        const saveToPath = path.join(os.tmpdir(), user.id, infoHash)
         const torrentHandle = client.add(torrent, {
-            path: `/tmp/${user.id}/${infoHash}`
+            path: saveToPath
         }, (torrent) => {
             torrentHandle.removeListener('error', callbackWithError);
 
@@ -388,7 +396,7 @@ const addTorrentForUser = (torrent, user, callback) => {
             }
             callback(null, torrent);
         });
-      
+
         torrentHandle.once('error', callbackWithError);
 
         return torrentHandle;
@@ -464,9 +472,9 @@ const attachCompleteHandler = (torrent, auth, socket) => {
     torrent.files.forEach((file) => {
         file.on('done', () => {
             // Update torrent as success if all files have completed
-            const torrentFolderPath = path.join(DRIVE_TORRENT_DIR, torrent.name);            
-            if (torrentIsDone(torrent)) { 
-                mutex.lock(() => {                    
+            const torrentFolderPath = path.join(DRIVE_TORRENT_DIR, torrent.name);
+            if (torrentIsDone(torrent)) {
+                mutex.lock(() => {
                     driveIO.createFolderIfNotExists(torrentFolderPath, DRIVE_RETURN_FIELDS, auth, (err, torrentFolder) => {
                         mutex.unlock();
                         if (err) {
@@ -492,7 +500,7 @@ const attachCompleteHandler = (torrent, auth, socket) => {
                             socket.emit('torrent-error', getTorrentInfo(torrent));
                         }
                         socket.emit('torrent-update', getTorrentInfo(torrent));
-                        console.log(`File uploaded to google drive: ${uploadPath}, with id: ${uploaded.id}`);         
+                        console.log(`File uploaded to google drive: ${uploadPath}, with id: ${uploaded.id}`);
                     });
                 });          
             }
